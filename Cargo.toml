@@ -1,0 +1,15 @@
+[package]
+name = "memalloc-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+slab = "0.4"
+quanta = "0.12"
+parquet = "53"
+arrow = "53"
+rand = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
