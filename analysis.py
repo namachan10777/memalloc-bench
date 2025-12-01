@@ -14,6 +14,29 @@ alt.data_transformers.disable_max_rows()
 # ns -> ms 変換係数
 NS_TO_MS = 1e-6
 
+# 表示ラベルのマッピング
+PLATFORM_LABELS = {
+    "mbp": "MacBook Pro (M1Max)",
+    "pegasus": "Intel Xeon Platinum 8468",
+}
+
+PATTERN_LABELS = {
+    "immediate": "Immediate",
+    "lifo": "LIFO",
+    "fifo": "FIFO",
+    "random": "Random",
+}
+
+
+def apply_labels(df: pl.DataFrame) -> pl.DataFrame:
+    """プラットフォームとパターンのラベルを変換"""
+    return df.with_columns(
+        [
+            pl.col("platform").replace(PLATFORM_LABELS).alias("platform"),
+            pl.col("pattern").replace(PATTERN_LABELS).alias("pattern"),
+        ]
+    )
+
 
 def load_all_data(results_dir: str = "results") -> pl.DataFrame:
     """results/配下の全parquetファイルを読み込んで結合"""
@@ -60,7 +83,7 @@ def create_line_chart_by_pattern(
 
     chart = (
         alt.Chart(data)
-        .mark_line(point=True)
+        .mark_line(point=False)
         .encode(
             x=alt.X("size_bytes:Q", scale=alt.Scale(type="log"), title="Size (bytes)"),
             y=alt.Y(f"{col}:Q", title=f"Median {metric.title()} Time (ms)"),
@@ -68,6 +91,7 @@ def create_line_chart_by_pattern(
             strokeDash=alt.StrokeDash("platform:N", title="Platform"),
         )
         .properties(width=600, height=400, title=f"Pattern: {pattern} ({metric})")
+        .configure_legend(labelLimit=600)
     )
     return chart
 
@@ -79,7 +103,7 @@ def create_all_patterns_chart(stats: pl.DataFrame, metric: str = "total") -> alt
 
     chart = (
         alt.Chart(data)
-        .mark_line(point=True)
+        .mark_line(point=False)
         .encode(
             x=alt.X("size_bytes:Q", scale=alt.Scale(type="log"), title="Size (bytes)"),
             y=alt.Y(
@@ -91,8 +115,9 @@ def create_all_patterns_chart(stats: pl.DataFrame, metric: str = "total") -> alt
             strokeDash=alt.StrokeDash("platform:N", title="Platform"),
         )
         .properties(width=300, height=200)
-        .facet(facet=alt.Facet("pattern:N", title="Pattern"), columns=3)
+        .facet(facet=alt.Facet("pattern:N", title="Pattern"), columns=2)
         .resolve_scale(y="independent")
+        .configure_legend(labelLimit=600)
     )
     return chart
 
@@ -122,6 +147,7 @@ def create_box_plot(
             height=300,
             title=f"Pattern: {pattern}, Size: {size} bytes ({metric})",
         )
+        .configure_legend(labelLimit=600)
     )
     return chart
 
@@ -146,6 +172,7 @@ def create_heatmap(
         .properties(width=500, height=150)
         .facet(row=alt.Row("platform:N", title="Platform"))
         .properties(title=f"Allocator: {allocator} ({metric})")
+        .configure_legend(labelLimit=600)
     )
     return chart
 
@@ -174,7 +201,7 @@ def create_comparison_chart(stats: pl.DataFrame, metric: str = "total") -> alt.C
 
     chart = (
         alt.Chart(data)
-        .mark_line(point=True)
+        .mark_line(point=False)
         .encode(
             x=alt.X("size_bytes:Q", scale=alt.Scale(type="log"), title="Size (bytes)"),
             y=alt.Y("ratio:Q", title="Box / Slab(warm) ratio"),
@@ -191,7 +218,7 @@ def create_comparison_chart(stats: pl.DataFrame, metric: str = "total") -> alt.C
     # ratio=1 の参照線
     rule = alt.Chart().mark_rule(strokeDash=[5, 5], color="gray").encode(y=alt.datum(1))
 
-    return chart + rule
+    return (chart + rule).configure_legend(labelLimit=600)
 
 
 def create_platform_comparison_chart(
@@ -203,7 +230,7 @@ def create_platform_comparison_chart(
 
     chart = (
         alt.Chart(data)
-        .mark_line(point=True)
+        .mark_line(strokeWidth=2)
         .encode(
             x=alt.X("size_bytes:Q", scale=alt.Scale(type="log"), title="Size (bytes)"),
             y=alt.Y(f"{col}:Q", title=f"Median {metric.title()} Time (ms)"),
@@ -211,8 +238,14 @@ def create_platform_comparison_chart(
             strokeDash=alt.StrokeDash("allocator:N", title="Allocator"),
         )
         .properties(width=300, height=200)
-        .facet(facet=alt.Facet("pattern:N", title="Pattern"), columns=3)
+        .facet(facet=alt.Facet("pattern:N", title="Pattern"), columns=2)
         .resolve_scale(y="independent")
+        .configure_legend(
+            symbolStrokeWidth=3,
+            symbolSize=100,
+            labelLimit=600,
+            titleLimit=300,
+        )
     )
     return chart
 
@@ -227,6 +260,9 @@ def main():
     df = load_all_data()
     platforms = df["platform"].unique().to_list()
     print(f"Loaded {len(df)} records from {len(platforms)} platform(s): {platforms}")
+
+    # ラベル変換
+    df = apply_labels(df)
 
     print("Computing statistics...")
     stats = compute_stats(df)
@@ -248,10 +284,10 @@ def main():
         print(f"  - results/all_patterns_{metric}.svg")
 
         # 2. 各パターン別の詳細チャート
-        for pattern in ["immediate", "lifo", "fifo", "random"]:
-            chart = create_line_chart_by_pattern(stats, pattern, metric=metric)
-            save_svg(chart, f"results/pattern_{pattern}_{metric}.svg")
-            print(f"  - results/pattern_{pattern}_{metric}.svg")
+        for pattern_key, pattern_label in PATTERN_LABELS.items():
+            chart = create_line_chart_by_pattern(stats, pattern_label, metric=metric)
+            save_svg(chart, f"results/pattern_{pattern_key}_{metric}.svg")
+            print(f"  - results/pattern_{pattern_key}_{metric}.svg")
 
         # 3. ヒートマップ
         for allocator in ["box", "slab_cold", "slab_warm"]:
@@ -270,10 +306,11 @@ def main():
         print(f"  - results/platform_comparison_{metric}.svg")
 
         # 6. ボックスプロット（代表的な条件）
-        for pattern, size in [("immediate", 64), ("lifo", 256), ("random", 1024)]:
-            boxplot = create_box_plot(df, pattern, size, metric=metric)
-            save_svg(boxplot, f"results/boxplot_{pattern}_{size}_{metric}.svg")
-            print(f"  - results/boxplot_{pattern}_{size}_{metric}.svg")
+        for pattern_key, size in [("immediate", 64), ("lifo", 256), ("random", 1024)]:
+            pattern_label = PATTERN_LABELS[pattern_key]
+            boxplot = create_box_plot(df, pattern_label, size, metric=metric)
+            save_svg(boxplot, f"results/boxplot_{pattern_key}_{size}_{metric}.svg")
+            print(f"  - results/boxplot_{pattern_key}_{size}_{metric}.svg")
 
     # 統計データもCSVで保存
     stats.write_csv("results/stats.csv")

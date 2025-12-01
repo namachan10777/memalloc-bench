@@ -11,6 +11,8 @@ use std::hint::black_box;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 
+mod bufpool;
+
 // 測定パラメータ
 const ITERATIONS: u32 = 100;
 const BATCH_SIZE: usize = 100;
@@ -56,6 +58,8 @@ enum Allocator {
     Box,
     SlabCold,
     SlabWarm,
+    BufpoolCold,
+    BufpoolWarm,
 }
 
 impl Allocator {
@@ -64,11 +68,19 @@ impl Allocator {
             Allocator::Box => "box",
             Allocator::SlabCold => "slab_cold",
             Allocator::SlabWarm => "slab_warm",
+            Allocator::BufpoolCold => "bufpool_cold",
+            Allocator::BufpoolWarm => "bufpool_warm",
         }
     }
 
     fn all() -> &'static [Allocator] {
-        &[Allocator::Box, Allocator::SlabCold, Allocator::SlabWarm]
+        &[
+            Allocator::Box,
+            Allocator::SlabCold,
+            Allocator::SlabWarm,
+            Allocator::BufpoolCold,
+            Allocator::BufpoolWarm,
+        ]
     }
 }
 
@@ -97,6 +109,13 @@ macro_rules! define_data_types {
                 #[inline(always)]
                 fn new() -> Self {
                     Self { _data: MaybeUninit::uninit() }
+                }
+            }
+
+            impl Default for $name {
+                #[inline(always)]
+                fn default() -> Self {
+                    Self::new()
                 }
             }
         )*
@@ -617,6 +636,402 @@ macro_rules! bench_random_slab_warm {
     }};
 }
 
+// bufpool用のアロケータ
+struct DataAllocator<T> {
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> DataAllocator<T> {
+    fn new() -> Self {
+        Self {
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Default> bufpool::BufferAllocator for DataAllocator<T> {
+    type Buffer = T;
+    type Error = std::convert::Infallible;
+
+    fn allocate(&self) -> Result<Self::Buffer, Self::Error> {
+        Ok(T::default())
+    }
+}
+
+// Bufpool: Immediate
+macro_rules! bench_immediate_bufpool_cold {
+    ($clock:expr, $data_type:ty) => {{
+        // 1回目のレイテンシを計測
+        let lat_start = $clock.raw();
+        for _ in 0..BATCH_SIZE {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            let lease = pool.lease().unwrap();
+            drop(black_box(lease));
+        }
+        let lat_end = $clock.raw();
+        let latency_ns = $clock.delta(lat_start, lat_end).as_nanos() as u64;
+
+        // 残りのループ
+        let start = $clock.raw();
+        for _ in 1..INNER_LOOP {
+            for _ in 0..BATCH_SIZE {
+                let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+                let lease = pool.lease().unwrap();
+                drop(black_box(lease));
+            }
+        }
+        let end = $clock.raw();
+        let rest_ns = $clock.delta(start, end).as_nanos() as u64;
+
+        BenchTiming {
+            total_ns: latency_ns + rest_ns,
+            latency_ns,
+        }
+    }};
+}
+
+macro_rules! bench_immediate_bufpool_warm {
+    ($clock:expr, $data_type:ty) => {{
+        // 1回目のレイテンシを計測
+        let lat_start = $clock.raw();
+        {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            // ウォームアップ: 1つ取得して返却
+            drop(pool.lease().unwrap());
+            for _ in 0..BATCH_SIZE {
+                let lease = pool.lease().unwrap();
+                drop(black_box(lease));
+            }
+        }
+        let lat_end = $clock.raw();
+        let latency_ns = $clock.delta(lat_start, lat_end).as_nanos() as u64;
+
+        // 残りのループ
+        let start = $clock.raw();
+        for _ in 1..INNER_LOOP {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            drop(pool.lease().unwrap());
+            for _ in 0..BATCH_SIZE {
+                let lease = pool.lease().unwrap();
+                drop(black_box(lease));
+            }
+        }
+        let end = $clock.raw();
+        let rest_ns = $clock.delta(start, end).as_nanos() as u64;
+
+        BenchTiming {
+            total_ns: latency_ns + rest_ns,
+            latency_ns,
+        }
+    }};
+}
+
+// Bufpool: LIFO
+macro_rules! bench_lifo_bufpool_cold {
+    ($clock:expr, $data_type:ty) => {{
+        // 1回目のレイテンシを計測
+        let lat_start = $clock.raw();
+        {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            let mut leases = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                leases.push(pool.lease().unwrap());
+            }
+            while let Some(lease) = leases.pop() {
+                drop(black_box(lease));
+            }
+        }
+        let lat_end = $clock.raw();
+        let latency_ns = $clock.delta(lat_start, lat_end).as_nanos() as u64;
+
+        // 残りのループ
+        let start = $clock.raw();
+        for _ in 1..INNER_LOOP {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            let mut leases = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                leases.push(pool.lease().unwrap());
+            }
+            while let Some(lease) = leases.pop() {
+                drop(black_box(lease));
+            }
+        }
+        let end = $clock.raw();
+        let rest_ns = $clock.delta(start, end).as_nanos() as u64;
+
+        BenchTiming {
+            total_ns: latency_ns + rest_ns,
+            latency_ns,
+        }
+    }};
+}
+
+macro_rules! bench_lifo_bufpool_warm {
+    ($clock:expr, $data_type:ty) => {{
+        // 1回目のレイテンシを計測
+        let lat_start = $clock.raw();
+        {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            // ウォームアップ: BATCH_SIZE個確保して返却
+            {
+                let mut warmup_leases = Vec::with_capacity(BATCH_SIZE);
+                for _ in 0..BATCH_SIZE {
+                    warmup_leases.push(pool.lease().unwrap());
+                }
+            }
+            let mut leases = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                leases.push(pool.lease().unwrap());
+            }
+            while let Some(lease) = leases.pop() {
+                drop(black_box(lease));
+            }
+        }
+        let lat_end = $clock.raw();
+        let latency_ns = $clock.delta(lat_start, lat_end).as_nanos() as u64;
+
+        // 残りのループ
+        let start = $clock.raw();
+        for _ in 1..INNER_LOOP {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            {
+                let mut warmup_leases = Vec::with_capacity(BATCH_SIZE);
+                for _ in 0..BATCH_SIZE {
+                    warmup_leases.push(pool.lease().unwrap());
+                }
+            }
+            let mut leases = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                leases.push(pool.lease().unwrap());
+            }
+            while let Some(lease) = leases.pop() {
+                drop(black_box(lease));
+            }
+        }
+        let end = $clock.raw();
+        let rest_ns = $clock.delta(start, end).as_nanos() as u64;
+
+        BenchTiming {
+            total_ns: latency_ns + rest_ns,
+            latency_ns,
+        }
+    }};
+}
+
+// Bufpool: FIFO
+macro_rules! bench_fifo_bufpool_cold {
+    ($clock:expr, $data_type:ty) => {{
+        // 1回目のレイテンシを計測
+        let lat_start = $clock.raw();
+        {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            let mut leases = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                leases.push(pool.lease().unwrap());
+            }
+            for lease in leases.into_iter() {
+                drop(black_box(lease));
+            }
+        }
+        let lat_end = $clock.raw();
+        let latency_ns = $clock.delta(lat_start, lat_end).as_nanos() as u64;
+
+        // 残りのループ
+        let start = $clock.raw();
+        for _ in 1..INNER_LOOP {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            let mut leases = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                leases.push(pool.lease().unwrap());
+            }
+            for lease in leases.into_iter() {
+                drop(black_box(lease));
+            }
+        }
+        let end = $clock.raw();
+        let rest_ns = $clock.delta(start, end).as_nanos() as u64;
+
+        BenchTiming {
+            total_ns: latency_ns + rest_ns,
+            latency_ns,
+        }
+    }};
+}
+
+macro_rules! bench_fifo_bufpool_warm {
+    ($clock:expr, $data_type:ty) => {{
+        // 1回目のレイテンシを計測
+        let lat_start = $clock.raw();
+        {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            // ウォームアップ
+            {
+                let mut warmup_leases = Vec::with_capacity(BATCH_SIZE);
+                for _ in 0..BATCH_SIZE {
+                    warmup_leases.push(pool.lease().unwrap());
+                }
+            }
+            let mut leases = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                leases.push(pool.lease().unwrap());
+            }
+            for lease in leases.into_iter() {
+                drop(black_box(lease));
+            }
+        }
+        let lat_end = $clock.raw();
+        let latency_ns = $clock.delta(lat_start, lat_end).as_nanos() as u64;
+
+        // 残りのループ
+        let start = $clock.raw();
+        for _ in 1..INNER_LOOP {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            {
+                let mut warmup_leases = Vec::with_capacity(BATCH_SIZE);
+                for _ in 0..BATCH_SIZE {
+                    warmup_leases.push(pool.lease().unwrap());
+                }
+            }
+            let mut leases = Vec::with_capacity(BATCH_SIZE);
+            for _ in 0..BATCH_SIZE {
+                leases.push(pool.lease().unwrap());
+            }
+            for lease in leases.into_iter() {
+                drop(black_box(lease));
+            }
+        }
+        let end = $clock.raw();
+        let rest_ns = $clock.delta(start, end).as_nanos() as u64;
+
+        BenchTiming {
+            total_ns: latency_ns + rest_ns,
+            latency_ns,
+        }
+    }};
+}
+
+// Bufpool: Random
+macro_rules! bench_random_bufpool_cold {
+    ($clock:expr, $data_type:ty, $rng:expr) => {{
+        // 1回目のレイテンシを計測
+        let lat_start = $clock.raw();
+        {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            let mut slots: Vec<Option<bufpool::Lease<DataAllocator<$data_type>>>> =
+                (0..BATCH_SIZE).map(|_| None).collect();
+            for _ in 0..(BATCH_SIZE * 2) {
+                let idx = $rng.gen_range(0..BATCH_SIZE);
+                if slots[idx].is_some() {
+                    drop(black_box(slots[idx].take()));
+                } else {
+                    slots[idx] = Some(pool.lease().unwrap());
+                    black_box(&slots[idx]);
+                }
+            }
+            // 残りを解放
+            for slot in slots.into_iter().flatten() {
+                drop(black_box(slot));
+            }
+        }
+        let lat_end = $clock.raw();
+        let latency_ns = $clock.delta(lat_start, lat_end).as_nanos() as u64;
+
+        // 残りのループ
+        let start = $clock.raw();
+        for _ in 1..INNER_LOOP {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            let mut slots: Vec<Option<bufpool::Lease<DataAllocator<$data_type>>>> =
+                (0..BATCH_SIZE).map(|_| None).collect();
+            for _ in 0..(BATCH_SIZE * 2) {
+                let idx = $rng.gen_range(0..BATCH_SIZE);
+                if slots[idx].is_some() {
+                    drop(black_box(slots[idx].take()));
+                } else {
+                    slots[idx] = Some(pool.lease().unwrap());
+                    black_box(&slots[idx]);
+                }
+            }
+            for slot in slots.into_iter().flatten() {
+                drop(black_box(slot));
+            }
+        }
+        let end = $clock.raw();
+        let rest_ns = $clock.delta(start, end).as_nanos() as u64;
+
+        BenchTiming {
+            total_ns: latency_ns + rest_ns,
+            latency_ns,
+        }
+    }};
+}
+
+macro_rules! bench_random_bufpool_warm {
+    ($clock:expr, $data_type:ty, $rng:expr) => {{
+        // 1回目のレイテンシを計測
+        let lat_start = $clock.raw();
+        {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            // ウォームアップ
+            {
+                let mut warmup_leases = Vec::with_capacity(BATCH_SIZE);
+                for _ in 0..BATCH_SIZE {
+                    warmup_leases.push(pool.lease().unwrap());
+                }
+            }
+            let mut slots: Vec<Option<bufpool::Lease<DataAllocator<$data_type>>>> =
+                (0..BATCH_SIZE).map(|_| None).collect();
+            for _ in 0..(BATCH_SIZE * 2) {
+                let idx = $rng.gen_range(0..BATCH_SIZE);
+                if slots[idx].is_some() {
+                    drop(black_box(slots[idx].take()));
+                } else {
+                    slots[idx] = Some(pool.lease().unwrap());
+                    black_box(&slots[idx]);
+                }
+            }
+            // 残りを解放
+            for slot in slots.into_iter().flatten() {
+                drop(black_box(slot));
+            }
+        }
+        let lat_end = $clock.raw();
+        let latency_ns = $clock.delta(lat_start, lat_end).as_nanos() as u64;
+
+        // 残りのループ
+        let start = $clock.raw();
+        for _ in 1..INNER_LOOP {
+            let pool = bufpool::BufferPool::new(DataAllocator::<$data_type>::new());
+            {
+                let mut warmup_leases = Vec::with_capacity(BATCH_SIZE);
+                for _ in 0..BATCH_SIZE {
+                    warmup_leases.push(pool.lease().unwrap());
+                }
+            }
+            let mut slots: Vec<Option<bufpool::Lease<DataAllocator<$data_type>>>> =
+                (0..BATCH_SIZE).map(|_| None).collect();
+            for _ in 0..(BATCH_SIZE * 2) {
+                let idx = $rng.gen_range(0..BATCH_SIZE);
+                if slots[idx].is_some() {
+                    drop(black_box(slots[idx].take()));
+                } else {
+                    slots[idx] = Some(pool.lease().unwrap());
+                    black_box(&slots[idx]);
+                }
+            }
+            for slot in slots.into_iter().flatten() {
+                drop(black_box(slot));
+            }
+        }
+        let end = $clock.raw();
+        let rest_ns = $clock.delta(start, end).as_nanos() as u64;
+
+        BenchTiming {
+            total_ns: latency_ns + rest_ns,
+            latency_ns,
+        }
+    }};
+}
+
 // サイズに応じたベンチマーク実行
 macro_rules! run_bench_for_size {
     ($clock:expr, $allocator:expr, $pattern:expr, $size:expr, $rng:expr, $($sz:expr => $data_type:ty),* $(,)?) => {
@@ -635,6 +1050,14 @@ macro_rules! run_bench_for_size {
                     (Allocator::Box, Pattern::Random) => bench_random_box!($clock, $data_type, $rng),
                     (Allocator::SlabCold, Pattern::Random) => bench_random_slab_cold!($clock, $data_type, $rng),
                     (Allocator::SlabWarm, Pattern::Random) => bench_random_slab_warm!($clock, $data_type, $rng),
+                    (Allocator::BufpoolCold, Pattern::Immediate) => bench_immediate_bufpool_cold!($clock, $data_type),
+                    (Allocator::BufpoolWarm, Pattern::Immediate) => bench_immediate_bufpool_warm!($clock, $data_type),
+                    (Allocator::BufpoolCold, Pattern::Lifo) => bench_lifo_bufpool_cold!($clock, $data_type),
+                    (Allocator::BufpoolWarm, Pattern::Lifo) => bench_lifo_bufpool_warm!($clock, $data_type),
+                    (Allocator::BufpoolCold, Pattern::Fifo) => bench_fifo_bufpool_cold!($clock, $data_type),
+                    (Allocator::BufpoolWarm, Pattern::Fifo) => bench_fifo_bufpool_warm!($clock, $data_type),
+                    (Allocator::BufpoolCold, Pattern::Random) => bench_random_bufpool_cold!($clock, $data_type, $rng),
+                    (Allocator::BufpoolWarm, Pattern::Random) => bench_random_bufpool_warm!($clock, $data_type, $rng),
                 },
             )*
             _ => panic!("Unsupported size: {}", $size),
