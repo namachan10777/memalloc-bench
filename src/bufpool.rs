@@ -1,8 +1,7 @@
 use std::{
-    cell::RefCell,
-    mem::ManuallyDrop,
+    cell::UnsafeCell,
+    marker::PhantomData,
     ops::{Deref, DerefMut},
-    rc::{Rc, Weak},
 };
 
 pub trait Buffer {
@@ -107,86 +106,120 @@ pub trait BufferAllocator {
     fn allocate(&self) -> Result<Self::Buffer, Self::Error>;
 }
 
-struct BufferPoolImpl<A: BufferAllocator> {
-    allocator: A,
-    stack: RefCell<Vec<A::Buffer>>,
+/// エントリ: バッファを常に保持し、次の空きインデックスも持つ
+struct Entry<T> {
+    buffer: T,
+    /// 空きの場合、次の空きスロットのインデックス（usize::MAXで終端）
+    next_free: usize,
 }
 
-pub struct Lease<A: BufferAllocator> {
-    buf: ManuallyDrop<A::Buffer>,
-    pool: Weak<BufferPoolImpl<A>>,
+const FREE_LIST_END: usize = usize::MAX;
+
+/// 内部プール状態（UnsafeCellで包む - シングルスレッド前提）
+struct PoolInner<A: BufferAllocator> {
+    allocator: A,
+    entries: Vec<Entry<A::Buffer>>,
+    /// フリーリストの先頭（usize::MAXで空）
+    free_head: usize,
 }
 
 pub struct BufferPool<A: BufferAllocator> {
-    pool: Rc<BufferPoolImpl<A>>,
+    inner: UnsafeCell<PoolInner<A>>,
+}
+
+pub struct Lease<'a, A: BufferAllocator> {
+    /// プールへの参照（ライフタイムで生存を保証）
+    pool: &'a BufferPool<A>,
+    /// このリースが持っているエントリのインデックス
+    index: usize,
+    /// PhantomDataで不変性を保証
+    _marker: PhantomData<&'a mut A::Buffer>,
 }
 
 impl<A: BufferAllocator> BufferPool<A> {
     pub fn new(allocator: A) -> Self {
         BufferPool {
-            pool: Rc::new(BufferPoolImpl {
+            inner: UnsafeCell::new(PoolInner {
                 allocator,
-                stack: RefCell::new(Vec::new()),
+                entries: Vec::new(),
+                free_head: FREE_LIST_END,
             }),
         }
     }
 
-    pub fn lease(&self) -> Result<Lease<A>, A::Error> {
-        if let Some(buf) = self.pool.stack.borrow_mut().pop() {
-            Ok(Lease {
-                buf: ManuallyDrop::new(buf),
-                pool: Rc::downgrade(&self.pool),
-            })
+    #[inline]
+    pub fn lease(&self) -> Result<Lease<'_, A>, A::Error> {
+        // SAFETY: シングルスレッド前提、&self経由でのみアクセス
+        let inner = unsafe { &mut *self.inner.get() };
+
+        let index = if inner.free_head != FREE_LIST_END {
+            // 空きスロットがある - フリーリストから取得
+            let idx = inner.free_head;
+            inner.free_head = inner.entries[idx].next_free;
+            inner.entries[idx].next_free = FREE_LIST_END; // 使用中マーク
+            idx
         } else {
-            let buf = self.pool.allocator.allocate()?;
-            Ok(Lease {
-                buf: ManuallyDrop::new(buf),
-                pool: Rc::downgrade(&self.pool),
-            })
-        }
+            // 新規アロケーション
+            let buf = inner.allocator.allocate()?;
+            let idx = inner.entries.len();
+            inner.entries.push(Entry {
+                buffer: buf,
+                next_free: FREE_LIST_END,
+            });
+            idx
+        };
+
+        Ok(Lease {
+            pool: self,
+            index,
+            _marker: PhantomData,
+        })
     }
 }
 
-impl<A: BufferAllocator> Drop for Lease<A> {
+impl<A: BufferAllocator> Drop for Lease<'_, A> {
+    #[inline]
     fn drop(&mut self) {
-        unsafe {
-            let buf = ManuallyDrop::take(&mut self.buf);
-            if let Some(pool) = self.pool.upgrade() {
-                pool.stack.borrow_mut().push(buf);
-            } else {
-                drop(buf);
-            }
-        }
+        // SAFETY: ライフタイムで生存保証、シングルスレッド前提
+        let inner = unsafe { &mut *self.pool.inner.get() };
+
+        // フリーリストに追加（バッファは保持したまま）
+        inner.entries[self.index].next_free = inner.free_head;
+        inner.free_head = self.index;
     }
 }
 
-impl<A: BufferAllocator> Buffer for Lease<A>
+impl<A: BufferAllocator> Deref for Lease<'_, A> {
+    type Target = A::Buffer;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        let inner = unsafe { &*self.pool.inner.get() };
+        &inner.entries[self.index].buffer
+    }
+}
+
+impl<A: BufferAllocator> DerefMut for Lease<'_, A> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let inner = unsafe { &mut *self.pool.inner.get() };
+        &mut inner.entries[self.index].buffer
+    }
+}
+
+impl<A: BufferAllocator> Buffer for Lease<'_, A>
 where
     A::Buffer: Buffer,
 {
     unsafe fn ptr(&self) -> *mut u8 {
-        unsafe { self.buf.ptr() }
+        unsafe { (**self).ptr() }
     }
 
     fn reset(&mut self) {
-        self.buf.reset();
+        (**self).reset();
     }
 
     unsafe fn size(&self) -> usize {
-        unsafe { self.buf.size() }
-    }
-}
-
-impl<A: BufferAllocator> Deref for Lease<A> {
-    type Target = A::Buffer;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.buf
-    }
-}
-
-impl<A: BufferAllocator> DerefMut for Lease<A> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.buf
+        unsafe { (**self).size() }
     }
 }
